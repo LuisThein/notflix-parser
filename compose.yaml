@@ -1,0 +1,18 @@
+name: notflix
+
+services:
+  parser:
+    build: .
+    image: notflix-parser:local
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POLL_INTERVAL: "10"
+      TZ: Europe/Berlin
+    shm_size: 256m
+    mem_limit: 1g
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"

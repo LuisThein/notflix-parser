@@ -1,127 +1,207 @@
-import imaplib
 import email
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.action_chains import ActionChains
-from email.header import decode_header
-import time
-from bs4 import BeautifulSoup
+import imaplib
+import logging
 import os
+import re
+import signal
+import sys
+import time
+from email.header import decode_header, make_header
+from pathlib import Path
+
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 
 # Account credentials
-USERNAME = os.environ.get("NOTFLIX_EMAIL")
-PASSWORD = os.environ.get("NOTFLIX_PASSWORT")
-IMAP_SERVER = os.environ.get("IMAP_SERVER")
+USERNAME = os.environ["NOTFLIX_EMAIL"]
+PASSWORD = os.environ["NOTFLIX_PASSWORT"]
+IMAP_SERVER = os.environ["IMAP_SERVER"]
+
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))
+# The IMAP connection is reused between polls and only renewed this often,
+# so frequent polling doesn't mean frequent logins
+RECONNECT_AFTER = int(os.environ.get("RECONNECT_AFTER", "900"))
+# After this many failed polls in a row the process exits, so Docker restarts it
+MAX_CONSECUTIVE_FAILURES = int(os.environ.get("MAX_CONSECUTIVE_FAILURES", "10"))
+# A mail whose button could not be clicked stays unread and is retried this often
+MAX_ATTEMPTS_PER_MAIL = 3
+# Touched after every successful poll; the Docker healthcheck watches its age
+HEARTBEAT_FILE = Path(os.environ.get("HEARTBEAT_FILE", "/tmp/notflix-heartbeat"))
+# Set in the Docker image; locally Selenium finds a driver on its own
+CHROMEDRIVER_PATH = os.environ.get("CHROMEDRIVER_PATH")
 
 TARGET_SUBJECT = "Important: How to update your Netflix Household"
+BUTTON_TEXT = "Yes, This Was Me"
 
-# Set up the WebDriver (Chrome in this case)
-#driver_path = "/usr/local/bin/chromedriver"  # Specify your WebDriver path here 
-options = webdriver.ChromeOptions()
-options.add_argument("--headless=new") # remove to see the browser open
-driver = webdriver.Chrome(options=options)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    stream=sys.stdout,
+)
+log = logging.getLogger("notflix")
 
-def process_important_email(body):
+attempts = {}
+
+
+def create_driver():
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    service = Service(executable_path=CHROMEDRIVER_PATH) if CHROMEDRIVER_PATH else Service()
+    return webdriver.Chrome(options=options, service=service)
+
+
+def confirm_household(body):
     """
-    This function processes the HTML email body to extract the URL from the specified button.
+    Extracts the confirmation link from the HTML mail body and clicks the
+    confirmation button on the Netflix page. Returns True on success.
     """
-    print("Processing important email with specified subject...")
-
-    # Parse HTML content with BeautifulSoup
     soup = BeautifulSoup(body, "html.parser")
+    button = soup.find("a", class_="h5", string=BUTTON_TEXT)
+    if not button or not button.get("href"):
+        log.warning("No '%s' link found in the mail", BUTTON_TEXT)
+        return False
 
-    # Find the <a> tag with class "h5" and text "Yes, This Was Me"
-    button = soup.find("a", class_="h5", string="Yes, This Was Me")
+    # A fresh browser per mail: a crashed Chrome can't break later runs
+    driver = create_driver()
+    try:
+        driver.get(button["href"])
+        confirm_button = WebDriverWait(driver, 30).until(
+            EC.element_to_be_clickable(
+                (By.CSS_SELECTOR, 'button[data-uia="set-primary-location-action"]')
+            )
+        )
+        confirm_button.click()
+        log.info("Confirmation button clicked")
+        return True
+    except Exception:
+        log.exception("Failed to locate or click the confirmation button")
+        return False
+    finally:
+        driver.quit()
 
-    # Extract the href attribute if the button is found
-    if button:
-        button_link = button.get("href")
-        print("Button link found:", button_link)
 
-        # Use Selenium to navigate to the button link
-        driver.get(button_link)
+def get_html_body(msg):
+    for part in msg.walk():
+        if part.get_content_type() == "text/html" and "attachment" not in str(
+            part.get("Content-Disposition")
+        ):
+            charset = part.get_content_charset() or "utf-8"
+            return part.get_payload(decode=True).decode(charset, errors="replace")
+    return ""
 
-        # Wait for the page to load
-        time.sleep(5)  # You might want to adjust this time based on page load speed
 
-        try:
-            # Locate the button by its data-uia attribute and click it
-            confirm_button = driver.find_element(By.CSS_SELECTOR, 'button[data-uia="set-primary-location-action"]')
-
-            # Scroll to the button if needed
-            ActionChains(driver).move_to_element(confirm_button).perform()
-            confirm_button.click()
-
-            print("Button clicked successfully.")
-        except Exception as e:
-            print("Failed to locate or click the confirmation button:", e)
-    else:
-        print("No relevant button link found in the email.")
-
-def fetch_unread_emails():
-    # Connect to the server and go to its inbox
-    mail = imaplib.IMAP4_SSL(IMAP_SERVER)
+def connect():
+    mail = imaplib.IMAP4_SSL(IMAP_SERVER, timeout=30)
     mail.login(USERNAME, PASSWORD)
     mail.select("inbox")
+    log.info("Logged in to %s", IMAP_SERVER)
+    return mail
 
-    # Search for all unread emails
-    status, messages = mail.search(None, 'UNSEEN')
 
-    # Convert the result into a list of email IDs
-    email_ids = messages[0].split()
-
-    # Loop over each email
-    for email_id in email_ids:
-        # Fetch the email by ID
-        status, msg_data = mail.fetch(email_id, "(RFC822)")
-        for response_part in msg_data:
-            if isinstance(response_part, tuple):
-                # Parse a bytes email into a message object
-                msg = email.message_from_bytes(response_part[1])
-
-                # Decode the email subject
-                subject, encoding = decode_header(msg["Subject"])[0]
-                if isinstance(subject, bytes):
-                    # If it's a bytes type, decode to str
-                    subject = subject.decode(encoding if encoding else "utf-8")
-                print("Subject:", subject)
-
-                # Check if the email subject matches the target subject
-                if subject == TARGET_SUBJECT:
-                    print("Target email found!")
-
-                    # If the email is multipart, extract the HTML part
-                    body = ""
-                    if msg.is_multipart():
-                        for part in msg.walk():
-                            content_type = part.get_content_type()
-                            content_disposition = str(part.get("Content-Disposition"))
-                            try:
-                                # Only process HTML parts
-                                if content_type == "text/html" and "attachment" not in content_disposition:
-                                    body = part.get_payload(decode=True).decode()
-                                    break  # Stop after finding the first HTML part
-                            except Exception as e:
-                                print(f"Could not decode body: {e}")
-                    else:
-                        # If it's not multipart, just get the payload
-                        body = msg.get_payload(decode=True).decode()
-
-                    # Pass the HTML body to the processing function
-                    process_important_email(body)
-
-        # Mark the mail as seen
-        mail.store(email_id, '+FLAGS', '\\Seen')
-
-    # Close the connection and logout
-    mail.close()
-    mail.logout()
-
-# Check for new emails every minute
-while True:
-    print("Checking for new emails...")
+def disconnect(mail):
     try:
-        fetch_unread_emails()
-    except:
-        print("Something went wron retrying in 60s")
-    time.sleep(60)
+        mail.logout()
+    except Exception:
+        pass
+
+
+def decode_subject(raw):
+    return str(make_header(decode_header(raw or "")))
+
+
+def delete_unneeded_mails(mail):
+    """
+    Permanently deletes every mail in the inbox whose subject is not the
+    household confirmation subject, read or unread.
+    """
+    status, data = mail.uid("SEARCH", None, "ALL")
+    uids = data[0].split()
+    if not uids:
+        return
+
+    status, data = mail.uid("FETCH", b",".join(uids), "(BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
+    unneeded = []
+    for part in data:
+        if not isinstance(part, tuple):
+            continue
+        uid = re.search(rb"UID (\d+)", part[0]).group(1)
+        subject = decode_subject(email.message_from_bytes(part[1])["Subject"])
+        if subject != TARGET_SUBJECT:
+            log.info("Deleting unneeded mail: %s", subject)
+            unneeded.append(uid)
+
+    if unneeded:
+        mail.uid("STORE", b",".join(unneeded), "+FLAGS", "(\\Deleted)")
+        mail.expunge()
+
+
+def check_mailbox(mail):
+    # NOOP makes the server report mails that arrived since the last check
+    mail.noop()
+
+    delete_unneeded_mails(mail)
+
+    # UIDs stay valid across the expunge above, sequence numbers don't
+    status, messages = mail.uid("SEARCH", None, "UNSEEN", "SUBJECT", '"Netflix Household"')
+    for uid in messages[0].split():
+        # PEEK keeps the mail unread until it has been handled
+        status, msg_data = mail.uid("FETCH", uid, "(BODY.PEEK[])")
+        msg = email.message_from_bytes(msg_data[0][1])
+        if decode_subject(msg["Subject"]) != TARGET_SUBJECT:
+            continue
+
+        message_id = msg["Message-ID"] or uid.decode()
+        log.info("Target mail found: %s", message_id)
+        attempts[message_id] = attempts.get(message_id, 0) + 1
+
+        if confirm_household(get_html_body(msg)):
+            mail.uid("STORE", uid, "+FLAGS", "(\\Seen)")
+            attempts.pop(message_id, None)
+        elif attempts[message_id] >= MAX_ATTEMPTS_PER_MAIL:
+            log.error("Giving up on %s after %d attempts", message_id, attempts[message_id])
+            mail.uid("STORE", uid, "+FLAGS", "(\\Seen)")
+            attempts.pop(message_id, None)
+
+
+def main():
+    # Let `docker stop` end the loop right away instead of waiting for SIGKILL
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+    log.info("Started, checking %s every %ds", IMAP_SERVER, POLL_INTERVAL)
+    mail = None
+    connected_at = 0.0
+    failures = 0
+    while True:
+        try:
+            if mail is not None and time.monotonic() - connected_at > RECONNECT_AFTER:
+                disconnect(mail)
+                mail = None
+            if mail is None:
+                mail = connect()
+                connected_at = time.monotonic()
+            check_mailbox(mail)
+            failures = 0
+            HEARTBEAT_FILE.touch()
+        except Exception:
+            failures += 1
+            log.exception("Mail check failed (%d/%d)", failures, MAX_CONSECUTIVE_FAILURES)
+            if mail is not None:
+                disconnect(mail)
+                mail = None
+            if failures >= MAX_CONSECUTIVE_FAILURES:
+                log.critical("Too many failures in a row, exiting for restart")
+                sys.exit(1)
+            # Back off on errors so a broken login isn't retried every few seconds
+            time.sleep(min(60 * failures, 600))
+            continue
+        time.sleep(POLL_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
