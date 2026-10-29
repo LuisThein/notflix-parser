@@ -1,0 +1,3 @@
+#!/bin/bash
+# After amend or rebase: drop entries of replaced commits, add the new ones.
+exec "$(git rev-parse --show-toplevel)/scripts/wiki-sync.sh" --rewritten

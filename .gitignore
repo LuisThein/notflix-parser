@@ -1,0 +1,31 @@
+# macOS
+.DS_Store
+
+# Editors
+.idea/
+*.swp
+
+# Claude Code local settings (may contain local paths)
+.claude/settings.local.json
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# codebase-memory-mcp snapshot (index stays in ~/.cache)
+.codebase-memory/
+
+# Python
+__pycache__/
+*.pyc
+
+# Old local virtualenv (the service runs in Docker)
+bin/
+include/
+lib/
+pyvenv.cfg
+
+# Local shell file and backups
+.zshrc
+*.bak-*

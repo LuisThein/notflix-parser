@@ -1,0 +1,5 @@
+#!/bin/bash
+# Record in the vault that this computer has no unpushed commits any more.
+# Runs before the push; a failed push is corrected by the next commit or stamp.
+"$(git rev-parse --show-toplevel)/scripts/wiki-sync.sh" --pushed
+exit 0

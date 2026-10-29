@@ -1,0 +1,36 @@
+#!/bin/bash
+# Commit messages: Conventional Commits, no attribution trailers.
+# Shared version from claude-standards.
+#
+# - Removes "Co-Authored-By:" and "Claude-Session:" lines silently.
+# - Rejects a subject without a Conventional Commits type,
+#   except for Merge, Revert, fixup!, squash! and amend! messages.
+
+msg="$1"
+tmp=$(mktemp) || exit 0
+trap 'rm -f "$tmp"' EXIT
+
+if grep -qiE '^(co-authored-by|claude-session):' "$msg"; then
+    # Drop the trailers and any blank lines left at the end.
+    grep -viE '^(co-authored-by|claude-session):' "$msg" |
+        awk '{ lines[NR] = $0 } NF { last = NR } END { for (i = 1; i <= last; i++) print lines[i] }' > "$tmp"
+    cat "$tmp" > "$msg"
+    echo "commit-msg: removed attribution trailers." >&2
+fi
+
+subject=$(grep -v '^#' "$msg" | grep -m1 -v '^[[:space:]]*$')
+
+case "$subject" in
+    "Merge "* | "Revert "* | "fixup! "* | "squash! "* | "amend! "*) exit 0 ;;
+esac
+
+types='feat|fix|docs|refactor|test|build|ci|chore|perf|style'
+if ! printf '%s\n' "$subject" | grep -qE "^($types)(\([^)]+\))?!?: [^ ]"; then
+    echo "commit-msg: subject must follow Conventional Commits, e.g. 'fix(core): handle empty profile'." >&2
+    echo "commit-msg: types: ${types//|/, }" >&2
+    echo "commit-msg: got: $subject" >&2
+    exit 1
+fi
+
+[ ${#subject} -le 72 ] || echo "commit-msg: note: subject is ${#subject} characters (aim for 72 or fewer)." >&2
+exit 0
