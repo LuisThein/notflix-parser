@@ -20,11 +20,12 @@ The maintainer's project documentation lives outside this repo, in the Obsidian 
 - `notflix-parser.py` – the whole service: IMAP polling loop, mail cleanup, Selenium confirmation
 - `Dockerfile`, `compose.yaml` – image with Debian Chromium, service `parser` in compose project `notflix`
 - `.env.example` – template for `.env`
+- `tests/` – unit tests for the pure functions (subject, HTML part, confirmation link); `scripts/test.sh` runs them
 - `.githooks/`, `scripts/` – Conventional Commits check and changelog hooks
 
 ## Commands
 
-- Test: no automated tests yet. Manual check before every commit: `docker compose up -d --build`, then `docker compose ps` shows `healthy` and `docker compose logs` shows a successful login without errors.
+- Test: `scripts/test.sh` (unit tests with `unittest` inside the service image, offline). Plus the manual check before every commit: `docker compose up -d --build`, then `docker compose ps` shows `healthy` and `docker compose logs` shows a successful login without errors.
 - Build and run: `docker compose up -d --build`
 - Logs: `docker compose logs -f`
 

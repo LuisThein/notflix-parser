@@ -27,4 +27,6 @@ Settings (environment): `NOTFLIX_EMAIL`, `NOTFLIX_PASSWORT`, `IMAP_SERVER`, opti
 
 ## Development
 
+Run the unit tests with `scripts/test.sh`. It builds the image and runs `unittest` inside it without network access, so no `.env` is needed.
+
 Maintainers: `scripts/setup.sh` activates the Git hooks (Conventional Commits check, changelog in the project notes). Contributors do not need it.
