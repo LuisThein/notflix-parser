@@ -36,6 +36,8 @@ CHROMEDRIVER_PATH = os.environ.get("CHROMEDRIVER_PATH")
 
 TARGET_SUBJECT = "Important: How to update your Netflix Household"
 BUTTON_TEXT = "Yes, This Was Me"
+# Path of the button's link target on netflix.com
+CONFIRM_PATH = "/account/update-primary-location"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,21 +58,36 @@ def create_driver():
     return webdriver.Chrome(options=options, service=service)
 
 
+def find_confirmation_link(body):
+    """
+    Returns the URL of the "Yes, This Was Me" button in the HTML mail body,
+    or None. Matches the link target first and the button text as a fallback,
+    never the CSS class: Netflix changes the mail layout from time to time.
+    """
+    soup = BeautifulSoup(body, "html.parser")
+    for a in soup.find_all("a", href=True):
+        if CONFIRM_PATH in a["href"]:
+            return a["href"]
+    for a in soup.find_all("a", href=True):
+        if a.get_text(" ", strip=True) == BUTTON_TEXT:
+            return a["href"]
+    return None
+
+
 def confirm_household(body):
     """
     Extracts the confirmation link from the HTML mail body and clicks the
     confirmation button on the Netflix page. Returns True on success.
     """
-    soup = BeautifulSoup(body, "html.parser")
-    button = soup.find("a", class_="h5", string=BUTTON_TEXT)
-    if not button or not button.get("href"):
+    link = find_confirmation_link(body)
+    if not link:
         log.warning("No '%s' link found in the mail", BUTTON_TEXT)
         return False
 
     # A fresh browser per mail: a crashed Chrome can't break later runs
     driver = create_driver()
     try:
-        driver.get(button["href"])
+        driver.get(link)
         confirm_button = WebDriverWait(driver, 30).until(
             EC.element_to_be_clickable(
                 (By.CSS_SELECTOR, 'button[data-uia="set-primary-location-action"]')
