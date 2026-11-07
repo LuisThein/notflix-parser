@@ -5,10 +5,13 @@ Run with `scripts/test.sh`, which uses the service image so the
 dependencies match production.
 """
 
+import email
 import importlib.util
 import json
 import os
+import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from email.header import Header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -259,7 +262,7 @@ class FindMainLinkTest(unittest.TestCase):
 class NotifyTest(unittest.TestCase):
     def test_sends_message_without_link_preview(self):
         with mock.patch.object(parser.urllib.request, "urlopen") as urlopen:
-            parser.notify("hello https://www.netflix.com/x")
+            parser.send_telegram("hello https://www.netflix.com/x")
         request = urlopen.call_args.args[0]
         self.assertEqual(request.full_url, "https://api.telegram.org/bot123:secret/sendMessage")
         payload = json.loads(request.data)
@@ -272,14 +275,46 @@ class NotifyTest(unittest.TestCase):
         error = parser.urllib.error.URLError("no network")
         with mock.patch.object(parser.urllib.request, "urlopen", side_effect=error):
             with self.assertLogs("notflix", "WARNING") as logs:
-                parser.notify("hello")
+                parser.send_telegram("hello")
         self.assertNotIn("secret", "\n".join(logs.output))
 
     def test_silent_without_configuration(self):
         with mock.patch.object(parser, "TELEGRAM_BOT_TOKEN", ""):
-            with mock.patch.object(parser.urllib.request, "urlopen") as urlopen:
+            with mock.patch.object(parser, "send_telegram") as send:
                 parser.notify("hello")
-        urlopen.assert_not_called()
+                parser.flush_notifications(1)
+        send.assert_not_called()
+
+    def test_notify_returns_before_sending(self):
+        # E-014: a slow Telegram must not delay the caller
+        release = parser.threading.Event()
+        sent = []
+
+        def slow_send(text):
+            release.wait(5)
+            sent.append(text)
+
+        with mock.patch.object(parser, "send_telegram", side_effect=slow_send):
+            parser.notify("one")
+            parser.notify("two")
+            self.assertEqual(sent, [])
+            release.set()
+            parser.flush_notifications(5)
+        self.assertEqual(sent, ["one", "two"])
+
+    def test_failing_send_does_not_stop_the_queue(self):
+        calls = []
+
+        def send(text):
+            calls.append(text)
+            if text == "bad":
+                raise RuntimeError("boom")
+
+        with mock.patch.object(parser, "send_telegram", side_effect=send), self.assertLogs("notflix"):
+            parser.notify("bad")
+            parser.notify("good")
+            parser.flush_notifications(5)
+        self.assertEqual(calls, ["bad", "good"])
 
 
 class MessagesTest(unittest.TestCase):
@@ -315,6 +350,7 @@ class FakeImap:
         self.seen = set()
         self.deleted = set()
         self.moved = {}
+        self.fetched = []
         self.capabilities = ("IMAP4REV1", "MOVE") if move else ("IMAP4REV1",)
 
     def noop(self):
@@ -336,6 +372,7 @@ class FakeImap:
         if command == "FETCH":
             data = []
             for u in uids(args[0]):
+                self.fetched.append(u)
                 raw = self.inbox[u]
                 if "HEADER.FIELDS" in args[1]:
                     raw = raw.split(b"\n\n")[0] + b"\n\n"
@@ -377,6 +414,9 @@ NEW_DEVICE = make_mail(
 
 @mock.patch.object(parser, "notify")
 class SortOtherMailsTest(unittest.TestCase):
+    def setUp(self):
+        parser.household_uids.clear()
+
     def test_moves_netflix_deletes_rest_keeps_household(self, notify):
         mail = FakeImap([HOUSEHOLD, CODE_MAIL, SPAM])
         parser.sort_other_mails(mail)
@@ -431,10 +471,114 @@ class SortOtherMailsTest(unittest.TestCase):
         notify.assert_not_called()
 
 
+    def test_known_household_headers_are_not_fetched_again(self, notify):
+        # E-013: only the first poll after login fetches all headers
+        parser.household_uids.clear()
+        mail = FakeImap([HOUSEHOLD, HOUSEHOLD])
+        parser.sort_other_mails(mail)
+        mail.fetched.clear()
+        parser.sort_other_mails(mail)
+        self.assertEqual(mail.fetched, [])
+        parser.household_uids.clear()
+
+
+class FakeButton:
+    def __init__(self, driver):
+        self.driver = driver
+
+    def is_displayed(self):
+        return not self.driver.confirmed
+
+    def is_enabled(self):
+        return True
+
+    def click(self):
+        self.driver.clicks += 1
+        if self.driver.clicks >= self.driver.react_on_click:
+            self.driver.confirmed = True
+
+
+class FakeDriver:
+    """Just enough of a Selenium WebDriver for confirm_household."""
+
+    def __init__(self, react_on_click):
+        self.react_on_click = react_on_click
+        self.clicks = 0
+        self.confirmed = False
+        self.current_url = "about:blank"
+        self.page_source = "<html></html>"
+        self.quit = mock.Mock()
+
+    def get(self, url):
+        # Netflix redirects while loading; that alone is no reaction
+        self.current_url = url + "&redirected=1"
+
+    def find_element(self, by, value):
+        return FakeButton(self)
+
+
+@mock.patch.object(parser, "CLICK_REACTION_TIMEOUT", 0.2)
+class ConfirmHouseholdTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.page = mock.patch.object(parser, "CONFIRM_PAGE", Path(self.tmp.name) / "page.html")
+        self.page.start()
+
+    def tearDown(self):
+        self.page.stop()
+        self.tmp.cleanup()
+
+    def confirm(self, driver):
+        with mock.patch.object(parser, "create_driver", return_value=driver):
+            return parser.confirm_household(CONFIRM_URL)
+
+    def test_page_reacts_to_first_click(self):
+        driver = FakeDriver(react_on_click=1)
+        self.assertTrue(self.confirm(driver))
+        self.assertEqual(driver.clicks, 1)
+        driver.quit.assert_called_once()
+        self.assertTrue(parser.CONFIRM_PAGE.exists())
+
+    def test_clicks_again_when_page_does_not_react(self):
+        # E-012: an early click before the JavaScript is ready may do nothing
+        driver = FakeDriver(react_on_click=2)
+        self.assertTrue(self.confirm(driver))
+        self.assertEqual(driver.clicks, 2)
+
+    def test_fails_when_page_never_reacts(self):
+        driver = FakeDriver(react_on_click=99)
+        with self.assertLogs("notflix", "WARNING"):
+            self.assertFalse(self.confirm(driver))
+        self.assertEqual(driver.clicks, parser.CLICK_TRIES)
+        driver.quit.assert_called_once()
+
+    def test_no_link(self):
+        with mock.patch.object(parser, "create_driver") as create:
+            with self.assertLogs("notflix", "WARNING"):
+                self.assertFalse(parser.confirm_household(None))
+        create.assert_not_called()
+
+
+class ReceivedAtTest(unittest.TestCase):
+    def test_topmost_received_header(self):
+        msg = email.message_from_string(
+            "Received: from mx.example.invalid by imap.example.invalid; Sat, 07 Nov 2026 10:43:38 +0100\n"
+            "Received: from sender.example.invalid; Sat, 07 Nov 2026 10:43:30 +0100\n\nbody"
+        )
+        self.assertEqual(
+            parser.received_at(msg), datetime(2026, 11, 7, 9, 43, 38, tzinfo=timezone.utc)
+        )
+
+    def test_missing_or_broken_header(self):
+        self.assertIsNone(parser.received_at(email.message_from_string("Subject: x\n\nbody")))
+        self.assertIsNone(parser.received_at(email.message_from_string("Received: nonsense\n\nbody")))
+
+
 @mock.patch.object(parser, "notify")
 class CheckMailboxTest(unittest.TestCase):
     def setUp(self):
         parser.attempts.clear()
+        parser.household_uids.clear()
 
     def test_success_sends_two_messages(self, notify):
         mail = FakeImap([HOUSEHOLD])

@@ -3,19 +3,23 @@ import imaplib
 import json
 import logging
 import os
+import queue
 import re
 import signal
 import sys
+import threading
 import time
 import urllib.request
 from email.header import decode_header, make_header
-from email.utils import parseaddr
+from datetime import datetime, timezone
+from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
+from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -55,6 +59,12 @@ ACCESS_CODE_SUBJECT = "Your Netflix temporary access code"
 ACCESS_CODE_PATH = "/account/travel/verify"
 # The last access code page is saved here, to sharpen the code detection
 ACCESS_CODE_PAGE = Path("/tmp/notflix-access-code-page.html")
+# The page after the confirmation click is saved here for analysis (E-012)
+CONFIRM_PAGE = Path("/tmp/notflix-confirm-page.html")
+CONFIRM_BUTTON = (By.CSS_SELECTOR, 'button[data-uia="set-primary-location-action"]')
+# Clicks per browser session until the page reacts, and seconds to wait each time
+CLICK_TRIES = 3
+CLICK_REACTION_TIMEOUT = 5
 # Netflix mails that are deleted without a message (E-011)
 SILENT_DELETE_SUBJECTS = ("A new device is using your account",)
 
@@ -66,6 +76,9 @@ logging.basicConfig(
 log = logging.getLogger("notflix")
 
 attempts = {}
+# UIDs known to be household mails, so their headers aren't fetched on every
+# poll; cleared on every login because UIDs are only valid per session (E-013)
+household_uids = set()
 
 # Chat messages, in German for the household chat
 MESSAGES = {
@@ -93,13 +106,50 @@ def message(key, **values):
     return MESSAGES[key].format(**values)
 
 
+notifications = queue.Queue()
+notifier_lock = threading.Lock()
+notifier = None
+
+
 def notify(text):
+    """
+    Queues a message for the Telegram chat and returns at once; a background
+    thread sends it, so a slow Telegram never delays a confirmation (E-014).
+    """
+    global notifier
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return
+    with notifier_lock:
+        if notifier is None or not notifier.is_alive():
+            notifier = threading.Thread(target=send_queued, name="notifier", daemon=True)
+            notifier.start()
+    notifications.put(text)
+
+
+def send_queued():
+    while True:
+        text = notifications.get()
+        try:
+            send_telegram(text)
+        except Exception:
+            # send_telegram doesn't raise; this only keeps the thread alive
+            log.exception("Notifier failed")
+        finally:
+            notifications.task_done()
+
+
+def flush_notifications(timeout=10):
+    """Waits until queued messages are sent, at most timeout seconds."""
+    deadline = time.monotonic() + timeout
+    while notifications.unfinished_tasks and time.monotonic() < deadline:
+        time.sleep(0.1)
+
+
+def send_telegram(text):
     """
     Sends a message to the Telegram chat. Never raises: a failed notification
     must not stop the mail handling.
     """
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
-        return
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
@@ -188,8 +238,7 @@ def read_access_code(link):
             log.warning("No access code found on the page")
             return None
         finally:
-            ACCESS_CODE_PAGE.write_text(driver.page_source)
-            log.info("Saved the access code page to %s", ACCESS_CODE_PAGE)
+            save_page(driver, ACCESS_CODE_PAGE)
     except Exception:
         log.exception("Failed to open the access code page")
         return None
@@ -231,6 +280,8 @@ def create_driver():
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    # Don't wait for images and trackers; callers wait for the element they need (E-012)
+    options.page_load_strategy = "none"
     service = Service(executable_path=CHROMEDRIVER_PATH) if CHROMEDRIVER_PATH else Service()
     return webdriver.Chrome(options=options, service=service)
 
@@ -260,23 +311,65 @@ def confirm_household(link):
         log.warning("No '%s' link found in the mail", BUTTON_TEXT)
         return False
 
+    started = time.monotonic()
     # A fresh browser per mail: a crashed Chrome can't break later runs
     driver = create_driver()
     try:
+        browser_ready = time.monotonic()
         driver.get(link)
-        confirm_button = WebDriverWait(driver, 30).until(
-            EC.element_to_be_clickable(
-                (By.CSS_SELECTOR, 'button[data-uia="set-primary-location-action"]')
-            )
-        )
-        confirm_button.click()
-        log.info("Confirmation button clicked")
-        return True
+        button = WebDriverWait(driver, 30).until(EC.element_to_be_clickable(CONFIRM_BUTTON))
+        page_ready = time.monotonic()
+        # Taken only now: redirects while loading must not count as a reaction
+        url = driver.current_url
+        for click in range(1, CLICK_TRIES + 1):
+            button.click()
+            if page_reacted(driver, button, url):
+                log.info(
+                    "Confirmation button clicked (click %d); browser %.1f s, page %.1f s, "
+                    "click %.1f s",
+                    click,
+                    browser_ready - started,
+                    page_ready - browser_ready,
+                    time.monotonic() - page_ready,
+                )
+                return True
+            log.warning("Page did not react to click %d", click)
+            # The page may have been rendered again: find the button anew
+            button = WebDriverWait(driver, 10).until(EC.element_to_be_clickable(CONFIRM_BUTTON))
+        return False
     except Exception:
         log.exception("Failed to locate or click the confirmation button")
         return False
     finally:
+        save_page(driver, CONFIRM_PAGE)
         driver.quit()
+
+
+def page_reacted(driver, button, url):
+    """
+    True when the click took effect: the button is gone or the page moved on.
+    A click before the page's JavaScript is ready may do nothing (E-012).
+    """
+    def reacted(d):
+        if d.current_url != url:
+            return True
+        try:
+            return not button.is_displayed()
+        except StaleElementReferenceException:
+            return True
+
+    try:
+        WebDriverWait(driver, CLICK_REACTION_TIMEOUT).until(reacted)
+        return True
+    except TimeoutException:
+        return False
+
+
+def save_page(driver, path):
+    try:
+        path.write_text(driver.page_source)
+    except Exception as e:
+        log.warning("Could not save the page to %s: %s", path, type(e).__name__)
 
 
 def get_html_body(msg):
@@ -294,6 +387,7 @@ def connect():
     mail.login(USERNAME, PASSWORD)
     ensure_folder(mail, OTHER_FOLDER)
     mail.select("inbox")
+    household_uids.clear()
     log.info("Logged in to %s", IMAP_SERVER)
     return mail
 
@@ -342,7 +436,7 @@ def sort_other_mails(mail):
     permanently deleted, read or unread.
     """
     status, data = mail.uid("SEARCH", None, "ALL")
-    uids = data[0].split()
+    uids = [uid for uid in data[0].split() if uid not in household_uids]
     if not uids:
         return
 
@@ -357,7 +451,9 @@ def sort_other_mails(mail):
         headers = email.message_from_bytes(part[1])
         subject = decode_subject(headers["Subject"])
         kind = classify(headers["From"], subject)
-        if kind in ("netflix", "access_code"):
+        if kind == "household":
+            household_uids.add(uid)
+        elif kind in ("netflix", "access_code"):
             keep_netflix_mail(mail, uid, subject, kind)
         elif kind == "other":
             log.info("Deleting unneeded mail: %s", subject)
@@ -390,9 +486,12 @@ def check_mailbox(mail):
     # NOOP makes the server report mails that arrived since the last check
     mail.noop()
 
+    # Household mails first, tidying up can wait (E-013)
+    confirm_household_mails(mail)
     sort_other_mails(mail)
 
-    # UIDs stay valid across the expunge above, sequence numbers don't
+
+def confirm_household_mails(mail):
     status, messages = mail.uid("SEARCH", None, "UNSEEN", "SUBJECT", '"Netflix Household"')
     for uid in messages[0].split():
         # PEEK keeps the mail unread until it has been handled
@@ -413,10 +512,27 @@ def check_mailbox(mail):
             mail.uid("STORE", uid, "+FLAGS", "(\\Seen)")
             attempts.pop(message_id, None)
             notify(message("household_confirmed"))
+            log_delay(msg)
         elif attempts[message_id] >= MAX_ATTEMPTS_PER_MAIL:
             log.error("Giving up on %s after %d attempts", message_id, attempts[message_id])
             mail.uid("STORE", uid, "+FLAGS", "(\\Seen)")
             notify(household_failed_message(attempts.pop(message_id), link))
+
+
+def received_at(msg):
+    """Time the receiving mail server stamped into the topmost Received header."""
+    received = msg.get_all("Received") or []
+    try:
+        return parsedate_to_datetime(received[0].rpartition(";")[2].strip())
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
+def log_delay(msg):
+    arrived = received_at(msg)
+    if arrived:
+        delay = (datetime.now(timezone.utc) - arrived).total_seconds()
+        log.info("Confirmed %.0f s after the mail server received the mail", delay)
 
 
 def household_failed_message(count, link):
@@ -460,6 +576,7 @@ def main():
             if failures >= MAX_CONSECUTIVE_FAILURES:
                 log.critical("Too many failures in a row, exiting for restart")
                 notify(message("exiting"))
+                flush_notifications()
                 sys.exit(1)
             # Back off on errors so a broken login isn't retried every few seconds
             time.sleep(min(60 * failures, 600))
