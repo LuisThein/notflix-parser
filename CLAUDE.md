@@ -13,15 +13,16 @@ The maintainer's project documentation lives outside this repo, in the Obsidian 
 - Changelog prefix: `notflix` (marker `%% notflix:commits %%`). After cloning: `scripts/setup.sh "<vault>" "Notflix Parser" notflix`.
 - This repo is public: no absolute paths, host names or mail addresses in committed files (E-001).
 - Never read or print `.env`; it holds the mail account credentials.
-- The service permanently deletes every inbox mail that is not the household mail. The account exists only for this; never point it at another mailbox.
+- The service moves other Netflix mails to the folder `Netflix-Andere` (E-008) and permanently deletes every other inbox mail that is not the household mail. The account exists only for this; never point it at another mailbox.
+- `.env` also holds the Telegram bot token; `scripts/telegram-chat-id.sh` reads it inside the container, never print it.
 
 ## Layout
 
-- `notflix-parser.py` – the whole service: IMAP polling loop, mail cleanup, Selenium confirmation
+- `notflix-parser.py` – the whole service: IMAP polling loop, mail sorting, Selenium confirmation, Telegram notifications
 - `Dockerfile`, `compose.yaml` – image with Debian Chromium, service `parser` in compose project `notflix`
 - `.env.example` – template for `.env`
-- `tests/` – unit tests for the pure functions (subject, HTML part, confirmation link); `scripts/test.sh` runs them
-- `.githooks/`, `scripts/` – Conventional Commits check and changelog hooks
+- `tests/` – unit tests for the parsing functions and, with a fake IMAP mailbox and mocked Telegram, for mail sorting and notifications; `scripts/test.sh` runs them
+- `.githooks/`, `scripts/` – Conventional Commits check and changelog hooks; `scripts/telegram-chat-id.sh` lists the chats that wrote to the bot
 
 ## Commands
 

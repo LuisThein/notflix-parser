@@ -8,7 +8,8 @@ Netflix asks members to confirm their household by mail ("Important: How to upda
 
 - Polls the inbox every 10 seconds and reuses the IMAP connection (renewed every 15 minutes)
 - Confirms each household mail in a fresh headless Chrome, retries up to 3 times
-- Permanently deletes all other mails in the inbox, so use a mailbox dedicated to this
+- Moves other mails from Netflix to the folder `Netflix-Andere` and permanently deletes all remaining mails in the inbox, so use a mailbox dedicated to this
+- Optional Telegram notifications: household mail received, confirmed or failed (with the link to click yourself), other Netflix mails, and service problems
 - Backs off after errors and exits after 10 failures in a row, so Docker restarts it
 - Docker healthcheck based on a heartbeat file
 
@@ -23,7 +24,11 @@ docker compose ps       # should show "healthy" after a few seconds
 docker compose logs -f
 ```
 
-Settings (environment): `NOTFLIX_EMAIL`, `NOTFLIX_PASSWORT`, `IMAP_SERVER`, optional `POLL_INTERVAL` (seconds, default 10), `RECONNECT_AFTER` (seconds, default 900), `MAX_CONSECUTIVE_FAILURES` (default 10).
+Settings (environment): `NOTFLIX_EMAIL`, `NOTFLIX_PASSWORT`, `IMAP_SERVER`, optional `POLL_INTERVAL` (seconds, default 10), `RECONNECT_AFTER` (seconds, default 900), `MAX_CONSECUTIVE_FAILURES` (default 10), `OTHER_FOLDER` (default `Netflix-Andere`).
+
+### Telegram notifications
+
+Create a bot with @BotFather and put its token into `TELEGRAM_BOT_TOKEN`. Add the bot to the chat that should get the messages, write `/start@<botname>` there and run `scripts/telegram-chat-id.sh` to get the chat id for `TELEGRAM_CHAT_ID`. Without both values the service runs silently. Link previews are turned off, so Telegram never opens a confirmation link itself. Messages are in German.
 
 ## Development
 

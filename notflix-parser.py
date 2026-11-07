@@ -1,13 +1,17 @@
 import email
 import imaplib
+import json
 import logging
 import os
 import re
 import signal
 import sys
 import time
+import urllib.request
 from email.header import decode_header, make_header
+from email.utils import parseaddr
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from bs4 import BeautifulSoup
 from selenium import webdriver
@@ -33,6 +37,13 @@ MAX_ATTEMPTS_PER_MAIL = 3
 HEARTBEAT_FILE = Path(os.environ.get("HEARTBEAT_FILE", "/tmp/notflix-heartbeat"))
 # Set in the Docker image; locally Selenium finds a driver on its own
 CHROMEDRIVER_PATH = os.environ.get("CHROMEDRIVER_PATH")
+# Telegram notifications (E-004); without these the service runs silently
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+# Netflix mails that are not the household mail are kept here (E-008)
+OTHER_FOLDER = os.environ.get("OTHER_FOLDER", "Netflix-Andere")
+# Failed polls in a row before the chat hears about it; single hiccups stay quiet
+NOTIFY_AFTER_FAILURES = 3
 
 TARGET_SUBJECT = "Important: How to update your Netflix Household"
 BUTTON_TEXT = "Yes, This Was Me"
@@ -47,6 +58,91 @@ logging.basicConfig(
 log = logging.getLogger("notflix")
 
 attempts = {}
+
+# Chat messages, in German for the household chat
+MESSAGES = {
+    "started": "Notflix Parser gestartet.",
+    "household_arrived": "Household-Mail angekommen, ich bestätige den Haushalt …",
+    "household_confirmed": "✅ Haushalt bestätigt.",
+    "household_failed": "⚠️ Haushalt nach {attempts} Versuchen nicht bestätigt. Bitte selbst klicken:\n{link}",
+    "household_failed_no_link": "⚠️ Haushalt nicht bestätigt: In der Mail war kein Bestätigungslink.",
+    "other_netflix": "📩 Andere Netflix-Mail: {subject}\n{link}\n(abgelegt in {folder})",
+    "other_netflix_no_link": "📩 Andere Netflix-Mail: {subject}\n(kein Link gefunden, abgelegt in {folder})",
+    "check_failing": "⚠️ Mail-Abruf schlägt fehl ({failures}x in Folge): {error}",
+    "check_recovered": "Mail-Abruf läuft wieder.",
+    "exiting": "❌ Zu viele Fehler in Folge, der Dienst startet neu.",
+}
+
+# Link texts and hosts that are never the main link of a Netflix mail
+FOOTER_TEXTS = ("help", "unsubscribe", "privacy", "terms", "notification", "preferences")
+FOOTER_HOSTS = ("help.netflix.com",)
+
+
+def message(key, **values):
+    return MESSAGES[key].format(**values)
+
+
+def notify(text):
+    """
+    Sends a message to the Telegram chat. Never raises: a failed notification
+    must not stop the mail handling.
+    """
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        # A link preview would make Telegram open the confirmation link
+        "link_preview_options": {"is_disabled": True},
+    }
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response.read()
+    except Exception as e:
+        # Only the error type and text: the URL contains the bot token
+        log.warning("Telegram notification failed: %s: %s", type(e).__name__, e)
+
+
+def is_netflix_sender(from_header):
+    domain = parseaddr(from_header or "")[1].rpartition("@")[2].lower()
+    return domain == "netflix.com" or domain.endswith(".netflix.com")
+
+
+def classify(from_header, subject):
+    """
+    Returns "household" for the household mail, "netflix" for any other mail
+    from Netflix and "other" for everything else.
+    """
+    if subject == TARGET_SUBJECT:
+        return "household"
+    if is_netflix_sender(from_header):
+        return "netflix"
+    return "other"
+
+
+def find_main_link(body):
+    """
+    Guesses the main link of a Netflix mail: the first link to netflix.com
+    with a text that is not a footer link. Kept simple on purpose until there
+    are enough real examples (E-008).
+    """
+    soup = BeautifulSoup(body, "html.parser")
+    for a in soup.find_all("a", href=True):
+        host = (urlsplit(a["href"]).hostname or "").lower()
+        if not (host == "netflix.com" or host.endswith(".netflix.com")):
+            continue
+        if host in FOOTER_HOSTS:
+            continue
+        text = a.get_text(" ", strip=True).lower()
+        if not text or any(word in text for word in FOOTER_TEXTS):
+            continue
+        return a["href"]
+    return None
 
 
 def create_driver():
@@ -74,12 +170,11 @@ def find_confirmation_link(body):
     return None
 
 
-def confirm_household(body):
+def confirm_household(link):
     """
-    Extracts the confirmation link from the HTML mail body and clicks the
-    confirmation button on the Netflix page. Returns True on success.
+    Opens the confirmation link and clicks the confirmation button on the
+    Netflix page. Returns True on success.
     """
-    link = find_confirmation_link(body)
     if not link:
         log.warning("No '%s' link found in the mail", BUTTON_TEXT)
         return False
@@ -116,6 +211,7 @@ def get_html_body(msg):
 def connect():
     mail = imaplib.IMAP4_SSL(IMAP_SERVER, timeout=30)
     mail.login(USERNAME, PASSWORD)
+    ensure_folder(mail, OTHER_FOLDER)
     mail.select("inbox")
     log.info("Logged in to %s", IMAP_SERVER)
     return mail
@@ -132,24 +228,57 @@ def decode_subject(raw):
     return str(make_header(decode_header(raw or "")))
 
 
-def delete_unneeded_mails(mail):
+def ensure_folder(mail, folder):
+    status, data = mail.list('""', folder)
+    if status == "OK" and any(data):
+        return
+    mail.create(folder)
+    mail.subscribe(folder)
+    log.info("Created folder %s", folder)
+
+
+def fetch_message(mail, uid):
+    status, data = mail.uid("FETCH", uid, "(BODY.PEEK[])")
+    for part in data or []:
+        if isinstance(part, tuple):
+            return email.message_from_bytes(part[1])
+    return None
+
+
+def move_mail(mail, uid, folder):
+    if "MOVE" in mail.capabilities:
+        mail.uid("MOVE", uid, folder)
+    else:
+        mail.uid("COPY", uid, folder)
+        mail.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
+        mail.expunge()
+
+
+def sort_other_mails(mail):
     """
-    Permanently deletes every mail in the inbox whose subject is not the
-    household confirmation subject, read or unread.
+    Keeps the inbox down to household mails: other Netflix mails are moved
+    to OTHER_FOLDER and reported to the chat (E-008), everything else is
+    permanently deleted, read or unread.
     """
     status, data = mail.uid("SEARCH", None, "ALL")
     uids = data[0].split()
     if not uids:
         return
 
-    status, data = mail.uid("FETCH", b",".join(uids), "(BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
+    status, data = mail.uid(
+        "FETCH", b",".join(uids), "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)])"
+    )
     unneeded = []
     for part in data:
         if not isinstance(part, tuple):
             continue
         uid = re.search(rb"UID (\d+)", part[0]).group(1)
-        subject = decode_subject(email.message_from_bytes(part[1])["Subject"])
-        if subject != TARGET_SUBJECT:
+        headers = email.message_from_bytes(part[1])
+        subject = decode_subject(headers["Subject"])
+        kind = classify(headers["From"], subject)
+        if kind == "netflix":
+            keep_netflix_mail(mail, uid, subject)
+        elif kind == "other":
             log.info("Deleting unneeded mail: %s", subject)
             unneeded.append(uid)
 
@@ -158,11 +287,23 @@ def delete_unneeded_mails(mail):
         mail.expunge()
 
 
+def keep_netflix_mail(mail, uid, subject):
+    msg = fetch_message(mail, uid)
+    link = find_main_link(get_html_body(msg)) if msg else None
+    move_mail(mail, uid, OTHER_FOLDER)
+    log.info("Moved Netflix mail to %s: %s", OTHER_FOLDER, subject)
+    # Notify only after the move, so a failed move can't repeat the message
+    if link:
+        notify(message("other_netflix", subject=subject, link=link, folder=OTHER_FOLDER))
+    else:
+        notify(message("other_netflix_no_link", subject=subject, folder=OTHER_FOLDER))
+
+
 def check_mailbox(mail):
     # NOOP makes the server report mails that arrived since the last check
     mail.noop()
 
-    delete_unneeded_mails(mail)
+    sort_other_mails(mail)
 
     # UIDs stay valid across the expunge above, sequence numbers don't
     status, messages = mail.uid("SEARCH", None, "UNSEEN", "SUBJECT", '"Netflix Household"')
@@ -176,14 +317,25 @@ def check_mailbox(mail):
         message_id = msg["Message-ID"] or uid.decode()
         log.info("Target mail found: %s", message_id)
         attempts[message_id] = attempts.get(message_id, 0) + 1
+        # At most two messages per mail, however often it is retried (E-007)
+        if attempts[message_id] == 1:
+            notify(message("household_arrived"))
 
-        if confirm_household(get_html_body(msg)):
+        link = find_confirmation_link(get_html_body(msg))
+        if confirm_household(link):
             mail.uid("STORE", uid, "+FLAGS", "(\\Seen)")
             attempts.pop(message_id, None)
+            notify(message("household_confirmed"))
         elif attempts[message_id] >= MAX_ATTEMPTS_PER_MAIL:
             log.error("Giving up on %s after %d attempts", message_id, attempts[message_id])
             mail.uid("STORE", uid, "+FLAGS", "(\\Seen)")
-            attempts.pop(message_id, None)
+            notify(household_failed_message(attempts.pop(message_id), link))
+
+
+def household_failed_message(count, link):
+    if link:
+        return message("household_failed", attempts=count, link=link)
+    return message("household_failed_no_link")
 
 
 def main():
@@ -191,6 +343,9 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
     log.info("Started, checking %s every %ds", IMAP_SERVER, POLL_INTERVAL)
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        log.info("Telegram not configured, notifications are off")
+    notify(message("started"))
     mail = None
     connected_at = 0.0
     failures = 0
@@ -203,16 +358,21 @@ def main():
                 mail = connect()
                 connected_at = time.monotonic()
             check_mailbox(mail)
+            if failures >= NOTIFY_AFTER_FAILURES:
+                notify(message("check_recovered"))
             failures = 0
             HEARTBEAT_FILE.touch()
-        except Exception:
+        except Exception as e:
             failures += 1
             log.exception("Mail check failed (%d/%d)", failures, MAX_CONSECUTIVE_FAILURES)
+            if failures == NOTIFY_AFTER_FAILURES:
+                notify(message("check_failing", failures=failures, error=type(e).__name__))
             if mail is not None:
                 disconnect(mail)
                 mail = None
             if failures >= MAX_CONSECUTIVE_FAILURES:
                 log.critical("Too many failures in a row, exiting for restart")
+                notify(message("exiting"))
                 sys.exit(1)
             # Back off on errors so a broken login isn't retried every few seconds
             time.sleep(min(60 * failures, 600))
