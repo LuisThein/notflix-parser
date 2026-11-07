@@ -8,7 +8,8 @@ Netflix asks members to confirm their household by mail ("Important: How to upda
 
 - Polls the inbox every 10 seconds and reuses the IMAP connection (renewed every 15 minutes)
 - Confirms each household mail in a fresh headless Chrome, retries up to 3 times
-- Moves other mails from Netflix to the folder `Netflix-Andere` and permanently deletes all remaining mails in the inbox, so use a mailbox dedicated to this
+- Moves other mails from Netflix to the folder `Netflix-Andere` and permanently deletes all remaining mails in the inbox (including "A new device is using your account"), so use a mailbox dedicated to this
+- For a temporary access code mail, opens the "Get Code" page in headless Chrome and sends the code itself to the chat
 - Optional Telegram notifications: household mail received, confirmed or failed (with the link to click yourself), other Netflix mails, and service problems
 - Backs off after errors and exits after 10 failures in a row, so Docker restarts it
 - Docker healthcheck based on a heartbeat file

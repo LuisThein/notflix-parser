@@ -49,6 +49,14 @@ TARGET_SUBJECT = "Important: How to update your Netflix Household"
 BUTTON_TEXT = "Yes, This Was Me"
 # Path of the button's link target on netflix.com
 CONFIRM_PATH = "/account/update-primary-location"
+# Temporary access code mail: the code is only shown on the page behind
+# the "Get Code" button (E-010)
+ACCESS_CODE_SUBJECT = "Your Netflix temporary access code"
+ACCESS_CODE_PATH = "/account/travel/verify"
+# The last access code page is saved here, to sharpen the code detection
+ACCESS_CODE_PAGE = Path("/tmp/notflix-access-code-page.html")
+# Netflix mails that are deleted without a message (E-011)
+SILENT_DELETE_SUBJECTS = ("A new device is using your account",)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,6 +74,9 @@ MESSAGES = {
     "household_confirmed": "✅ Haushalt bestätigt.",
     "household_failed": "⚠️ Haushalt nach {attempts} Versuchen nicht bestätigt. Bitte selbst klicken:\n{link}",
     "household_failed_no_link": "⚠️ Haushalt nicht bestätigt: In der Mail war kein Bestätigungslink.",
+    "access_code": "🔑 Netflix-Zugangscode: {code}\n(Link, falls nötig: {link})",
+    "access_code_unread": "🔑 Netflix-Zugangscode angefordert. Den Code konnte ich nicht lesen, bitte selbst öffnen (15 Minuten gültig):\n{link}",
+    "access_code_no_link": "🔑 Netflix-Zugangscode angefordert, aber in der Mail war kein Link.",
     "other_netflix": "📩 Andere Netflix-Mail: {subject}\n{link}\n(abgelegt in {folder})",
     "other_netflix_no_link": "📩 Andere Netflix-Mail: {subject}\n(kein Link gefunden, abgelegt in {folder})",
     "check_failing": "⚠️ Mail-Abruf schlägt fehl ({failures}x in Folge): {error}",
@@ -115,14 +126,84 @@ def is_netflix_sender(from_header):
 
 def classify(from_header, subject):
     """
-    Returns "household" for the household mail, "netflix" for any other mail
-    from Netflix and "other" for everything else.
+    Returns "household" for the household mail, "access_code" for the
+    temporary access code mail, "netflix" for any other mail from Netflix
+    and "other" (deleted) for everything else.
     """
     if subject == TARGET_SUBJECT:
         return "household"
-    if is_netflix_sender(from_header):
-        return "netflix"
-    return "other"
+    if not is_netflix_sender(from_header) or subject in SILENT_DELETE_SUBJECTS:
+        return "other"
+    if subject == ACCESS_CODE_SUBJECT:
+        return "access_code"
+    return "netflix"
+
+
+def find_link_by_path(body, path):
+    soup = BeautifulSoup(body, "html.parser")
+    for a in soup.find_all("a", href=True):
+        if urlsplit(a["href"]).path == path:
+            return a["href"]
+    return None
+
+
+# Four to six digits, optionally shown one per box, not part of a longer number
+CODE_PATTERN = r"(?<![\d-])(\d(?:\s?\d){3,5})(?![\d-])"
+
+
+def extract_access_code(page_html):
+    """
+    Returns the temporary access code shown on the Netflix page, or None.
+    The page of 2026-11-07 shows it in data-uia="travel-verification-otp";
+    any data-uia with "otp" or "code" counts, then digits shortly after the
+    word "code" as a fallback (E-010).
+    """
+    soup = BeautifulSoup(page_html, "html.parser")
+    for element in soup.find_all(attrs={"data-uia": re.compile("otp|code", re.I)}):
+        match = re.fullmatch(r"\s*" + CODE_PATTERN + r"\s*", element.get_text(" ", strip=True))
+        if match:
+            return re.sub(r"\s", "", match.group(1))
+    for script in soup(["script", "style"]):
+        script.decompose()
+    text = soup.get_text(" ", strip=True)
+    match = re.search(r"code\D{0,80}?" + CODE_PATTERN, text, re.I)
+    if match:
+        return re.sub(r"\s", "", match.group(1))
+    return None
+
+
+def read_access_code(link):
+    """
+    Opens the "Get Code" page and returns the code shown there, or None.
+    Saves the page for later analysis either way.
+    """
+    driver = create_driver()
+    try:
+        driver.get(link)
+        try:
+            return WebDriverWait(driver, 20).until(
+                lambda d: extract_access_code(d.page_source)
+            )
+        except Exception:
+            log.warning("No access code found on the page")
+            return None
+        finally:
+            ACCESS_CODE_PAGE.write_text(driver.page_source)
+            log.info("Saved the access code page to %s", ACCESS_CODE_PAGE)
+    except Exception:
+        log.exception("Failed to open the access code page")
+        return None
+    finally:
+        driver.quit()
+
+
+def access_code_message(link):
+    if not link:
+        return message("access_code_no_link")
+    code = read_access_code(link)
+    if code:
+        return message("access_code", code=code, link=link)
+    return message("access_code_unread", link=link)
 
 
 def find_main_link(body):
@@ -276,8 +357,8 @@ def sort_other_mails(mail):
         headers = email.message_from_bytes(part[1])
         subject = decode_subject(headers["Subject"])
         kind = classify(headers["From"], subject)
-        if kind == "netflix":
-            keep_netflix_mail(mail, uid, subject)
+        if kind in ("netflix", "access_code"):
+            keep_netflix_mail(mail, uid, subject, kind)
         elif kind == "other":
             log.info("Deleting unneeded mail: %s", subject)
             unneeded.append(uid)
@@ -287,16 +368,22 @@ def sort_other_mails(mail):
         mail.expunge()
 
 
-def keep_netflix_mail(mail, uid, subject):
+def keep_netflix_mail(mail, uid, subject, kind="netflix"):
     msg = fetch_message(mail, uid)
-    link = find_main_link(get_html_body(msg)) if msg else None
+    body = get_html_body(msg) if msg else ""
+    if kind == "access_code":
+        # The code page is read before the move: the link is valid for 15 minutes only
+        text = access_code_message(find_link_by_path(body, ACCESS_CODE_PATH))
+    else:
+        link = find_main_link(body)
+        if link:
+            text = message("other_netflix", subject=subject, link=link, folder=OTHER_FOLDER)
+        else:
+            text = message("other_netflix_no_link", subject=subject, folder=OTHER_FOLDER)
     move_mail(mail, uid, OTHER_FOLDER)
     log.info("Moved Netflix mail to %s: %s", OTHER_FOLDER, subject)
     # Notify only after the move, so a failed move can't repeat the message
-    if link:
-        notify(message("other_netflix", subject=subject, link=link, folder=OTHER_FOLDER))
-    else:
-        notify(message("other_netflix_no_link", subject=subject, folder=OTHER_FOLDER))
+    notify(text)
 
 
 def check_mailbox(mail):

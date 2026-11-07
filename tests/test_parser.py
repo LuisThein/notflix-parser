@@ -140,6 +140,91 @@ class ClassifyTest(unittest.TestCase):
     def test_missing_from(self):
         self.assertEqual(parser.classify(None, "Hello"), "other")
 
+    def test_access_code_mail(self):
+        self.assertEqual(
+            parser.classify("Netflix <info@account.netflix.com>", parser.ACCESS_CODE_SUBJECT),
+            "access_code",
+        )
+
+    def test_new_device_mail_is_deleted(self):
+        # E-011: no message for this one
+        self.assertEqual(
+            parser.classify("Netflix <info@account.netflix.com>", "A new device is using your account"),
+            "other",
+        )
+
+    def test_access_code_subject_from_stranger_is_other(self):
+        self.assertEqual(parser.classify("x@spam.invalid", parser.ACCESS_CODE_SUBJECT), "other")
+
+
+CODE_URL = "https://www.netflix.com/account/travel/verify?nftoken=abc"
+
+# Shortened from the access code mail of 2026-11-07, tokens and names removed
+ACCESS_CODE_MAIL = f"""
+<p>Hi Member,</p>
+<p>We received a request for a temporary access code from the device below.</p>
+<a href="{CODE_URL}">Get Code</a>
+<p>* Link expires after 15 minutes.</p>
+<a href="https://www.netflix.com/ManageAccountAccess?g=1">sign out of all devices that you don't recognize</a>
+<a href="https://www.netflix.com/password?g=1">change your password</a>
+<a href="https://help.netflix.com/help?g=1">Help Center</a>
+"""
+
+
+class FindLinkByPathTest(unittest.TestCase):
+    def test_access_code_link(self):
+        self.assertEqual(
+            parser.find_link_by_path(ACCESS_CODE_MAIL, parser.ACCESS_CODE_PATH), CODE_URL
+        )
+
+    def test_path_must_match_exactly(self):
+        body = '<a href="https://www.netflix.com/account/travel/verify-other">x</a>'
+        self.assertIsNone(parser.find_link_by_path(body, parser.ACCESS_CODE_PATH))
+
+    def test_main_link_of_access_code_mail(self):
+        self.assertEqual(parser.find_main_link(ACCESS_CODE_MAIL), CODE_URL)
+
+
+# Shortened from the German code page of 2026-11-07, code and profiles changed
+ACCESS_CODE_PAGE_2026_11 = """
+<div class="profile-name">Member</div>
+<h1>Verwenden Sie diesen Code, um Netflix auf Ihrem Gerät zu nutzen</h1>
+<p>Geben Sie diesen Code auf dem Gerät ein, über das Sie ihn angefordert haben.
+Dann erhalten Sie vorübergehend Zugang.</p>
+<div data-uia="travel-verification-otp">4821</div>
+<p>Dieser Code läuft nach 15 Minuten ab.</p>
+<a data-uia="footer-link" href="https://help.netflix.com/">Hilfe-Center</a>
+"""
+
+
+class ExtractAccessCodeTest(unittest.TestCase):
+    def test_current_page(self):
+        self.assertEqual(parser.extract_access_code(ACCESS_CODE_PAGE_2026_11), "4821")
+
+    def test_data_uia_element(self):
+        page = '<p>Footer 2026</p><div data-uia="travel-code"> 4711 </div>'
+        self.assertEqual(parser.extract_access_code(page), "4711")
+
+    def test_digits_in_separate_boxes(self):
+        page = '<div data-uia="access-code"><span>1</span><span>2</span><span>3</span><span>4</span></div>'
+        self.assertEqual(parser.extract_access_code(page), "1234")
+
+    def test_text_after_code(self):
+        page = "<h1>Your temporary access code</h1><p>Enter this code on your TV:</p><strong>8352</strong><p>© 2026 Netflix</p>"
+        self.assertEqual(parser.extract_access_code(page), "8352")
+
+    def test_ignores_scripts(self):
+        page = '<script>var code = 99999;</script><p>Something went wrong</p>'
+        self.assertIsNone(parser.extract_access_code(page))
+
+    def test_no_code(self):
+        page = "<h1>This link has expired</h1><p>Request a new code from your TV.</p>"
+        self.assertIsNone(parser.extract_access_code(page))
+
+    def test_ignores_longer_numbers(self):
+        page = "<p>Your code request 1234567 was received.</p>"
+        self.assertIsNone(parser.extract_access_code(page))
+
 
 class FindMainLinkTest(unittest.TestCase):
     def test_first_netflix_link_with_text(self):
@@ -199,7 +284,7 @@ class NotifyTest(unittest.TestCase):
 
 class MessagesTest(unittest.TestCase):
     def test_all_messages_format(self):
-        values = dict(attempts=3, link="L", subject="S", folder="F", failures=3, error="E")
+        values = dict(attempts=3, link="L", subject="S", folder="F", failures=3, error="E", code="C")
         for key in parser.MESSAGES:
             with self.subTest(key=key):
                 self.assertTrue(parser.message(key, **values))
@@ -280,6 +365,14 @@ CODE_MAIL = make_mail(
     '<a href="https://www.netflix.com/account/travel/verify?t=1">Get Code</a>',
 )
 SPAM = make_mail("Shop <deals@shop.example.invalid>", "50% off")
+ACCESS_CODE = make_mail(
+    "Netflix <info@account.netflix.com>", parser.ACCESS_CODE_SUBJECT, ACCESS_CODE_MAIL
+)
+NEW_DEVICE = make_mail(
+    "Netflix <info@account.netflix.com>",
+    "A new device is using your account",
+    '<a href="https://www.netflix.com/password?g=1">change your password</a>',
+)
 
 
 @mock.patch.object(parser, "notify")
@@ -304,6 +397,31 @@ class SortOtherMailsTest(unittest.TestCase):
         mail = FakeImap([make_mail("info@netflix.com", "News")])
         parser.sort_other_mails(mail)
         self.assertIn("kein Link", notify.call_args.args[0])
+
+    def test_access_code_is_read_and_sent(self, notify):
+        mail = FakeImap([ACCESS_CODE])
+        with mock.patch.object(parser, "read_access_code", return_value="4711") as read:
+            parser.sort_other_mails(mail)
+        read.assert_called_once_with(CODE_URL)
+        self.assertEqual(mail.moved, {b"1": parser.OTHER_FOLDER})
+        text = notify.call_args.args[0]
+        self.assertIn("4711", text)
+        self.assertIn(CODE_URL, text)
+
+    def test_access_code_unreadable_sends_link(self, notify):
+        mail = FakeImap([ACCESS_CODE])
+        with mock.patch.object(parser, "read_access_code", return_value=None):
+            parser.sort_other_mails(mail)
+        self.assertEqual(
+            notify.call_args.args[0], parser.message("access_code_unread", link=CODE_URL)
+        )
+
+    def test_new_device_mail_deleted_silently(self, notify):
+        mail = FakeImap([NEW_DEVICE])
+        parser.sort_other_mails(mail)
+        self.assertEqual(mail.inbox, {})
+        self.assertEqual(mail.moved, {})
+        notify.assert_not_called()
 
     def test_spam_is_deleted_silently(self, notify):
         mail = FakeImap([SPAM])

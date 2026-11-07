@@ -35,3 +35,4 @@ The maintainer's project documentation lives outside this repo, in the Obsidian 
 - Use IMAP UIDs, not sequence numbers: the cleanup expunges mails and shifts sequence numbers.
 - Read mails with `BODY.PEEK[]` so they stay unread until handled; mark them `\Seen` only after success or after `MAX_ATTEMPTS_PER_MAIL`.
 - Each confirmation uses a fresh headless Chrome, so a crashed browser can't break later runs.
+- The temporary access code is not in the mail: the service opens the "Get Code" link (valid 15 minutes) and reads `data-uia="travel-verification-otp"` (E-010). Mails "A new device is using your account" are deleted without a message (E-011).
