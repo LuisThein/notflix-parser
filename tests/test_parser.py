@@ -510,13 +510,6 @@ class SortOtherMailsTest(unittest.TestCase):
         notify.assert_not_called()
         self.assertIn("Netflix confirmed the household update", "\n".join(logs.output))
 
-    def test_spike_test_mail_stays(self, notify):
-        # E-016: temporary, for the IMAP IDLE spike
-        mail = FakeImap([make_mail("Luis <me@example.invalid>", "Idle latenz test ")])
-        parser.sort_other_mails(mail)
-        self.assertEqual(list(mail.inbox), [b"1"])
-        notify.assert_not_called()
-
     def test_spam_is_deleted_silently(self, notify):
         mail = FakeImap([SPAM])
         parser.sort_other_mails(mail)
