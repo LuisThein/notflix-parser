@@ -1,4 +1,5 @@
 import email
+import html
 import imaplib
 import json
 import logging
@@ -9,6 +10,7 @@ import signal
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from email.header import decode_header, make_header
 from datetime import datetime, timezone
@@ -80,17 +82,19 @@ attempts = {}
 # poll; cleared on every login because UIDs are only valid per session (E-013)
 household_uids = set()
 
-# Chat messages, in German for the household chat
+# Chat messages, in German for the household chat. Telegram HTML: links sit
+# behind a short text, the access code in <code> can be copied with one tap.
+# Values are escaped in message(), so the templates are the only markup.
 MESSAGES = {
     "started": "Notflix Parser gestartet.",
     "household_arrived": "Household-Mail angekommen, ich bestätige den Haushalt …",
     "household_confirmed": "✅ Haushalt bestätigt.",
-    "household_failed": "⚠️ Haushalt nach {attempts} Versuchen nicht bestätigt. Bitte selbst klicken:\n{link}",
+    "household_failed": '⚠️ Haushalt nach {attempts} Versuchen nicht bestätigt. <a href="{link}">Jetzt selbst bestätigen</a>',
     "household_failed_no_link": "⚠️ Haushalt nicht bestätigt: In der Mail war kein Bestätigungslink.",
-    "access_code": "🔑 Netflix-Zugangscode: {code}\n(Link, falls nötig: {link})",
-    "access_code_unread": "🔑 Netflix-Zugangscode angefordert. Den Code konnte ich nicht lesen, bitte selbst öffnen (15 Minuten gültig):\n{link}",
+    "access_code": '🔑 Netflix-Zugangscode: <code>{code}</code>\n<a href="{link}">Code-Seite öffnen</a>',
+    "access_code_unread": '🔑 Netflix-Zugangscode angefordert, den Code konnte ich nicht lesen. <a href="{link}">Code-Seite öffnen</a> (15 Minuten gültig)',
     "access_code_no_link": "🔑 Netflix-Zugangscode angefordert, aber in der Mail war kein Link.",
-    "other_netflix": "📩 Andere Netflix-Mail: {subject}\n{link}\n(abgelegt in {folder})",
+    "other_netflix": '📩 Andere Netflix-Mail: {subject}\n<a href="{link}">Link öffnen</a> (abgelegt in {folder})',
     "other_netflix_no_link": "📩 Andere Netflix-Mail: {subject}\n(kein Link gefunden, abgelegt in {folder})",
     "check_failing": "⚠️ Mail-Abruf schlägt fehl ({failures}x in Folge): {error}",
     "check_recovered": "Mail-Abruf läuft wieder.",
@@ -103,7 +107,14 @@ FOOTER_HOSTS = ("help.netflix.com",)
 
 
 def message(key, **values):
-    return MESSAGES[key].format(**values)
+    escaped = {name: html.escape(str(value)) for name, value in values.items()}
+    return MESSAGES[key].format(**escaped)
+
+
+def plain_text(text):
+    """The message without markup, with each link written out after its text."""
+    text = re.sub(r'<a href="([^"]*)">([^<]*)</a>', r"\2: \1", text)
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
 
 
 notifications = queue.Queue()
@@ -147,26 +158,39 @@ def flush_notifications(timeout=10):
 
 def send_telegram(text):
     """
-    Sends a message to the Telegram chat. Never raises: a failed notification
-    must not stop the mail handling.
+    Sends an HTML message to the Telegram chat. Never raises: a failed
+    notification must not stop the mail handling. If Telegram rejects the
+    markup, the message is sent again as plain text.
     """
+    try:
+        try:
+            post_message(text, html_markup=True)
+        except urllib.error.HTTPError as e:
+            if e.code != 400:
+                raise
+            log.warning("Telegram rejected the HTML message, sending it as plain text")
+            post_message(plain_text(text), html_markup=False)
+    except Exception as e:
+        # Only the error type and text: the URL contains the bot token
+        log.warning("Telegram notification failed: %s: %s", type(e).__name__, e)
+
+
+def post_message(text, html_markup):
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         # A link preview would make Telegram open the confirmation link
         "link_preview_options": {"is_disabled": True},
     }
+    if html_markup:
+        payload["parse_mode"] = "HTML"
     request = urllib.request.Request(
         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
         data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
     )
-    try:
-        with urllib.request.urlopen(request, timeout=10) as response:
-            response.read()
-    except Exception as e:
-        # Only the error type and text: the URL contains the bot token
-        log.warning("Telegram notification failed: %s: %s", type(e).__name__, e)
+    with urllib.request.urlopen(request, timeout=10) as response:
+        response.read()
 
 
 def is_netflix_sender(from_header):

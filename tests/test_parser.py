@@ -268,6 +268,7 @@ class NotifyTest(unittest.TestCase):
         payload = json.loads(request.data)
         self.assertEqual(payload["chat_id"], "-100123")
         self.assertEqual(payload["text"], "hello https://www.netflix.com/x")
+        self.assertEqual(payload["parse_mode"], "HTML")
         # A preview would make Telegram open the confirmation link itself
         self.assertTrue(payload["link_preview_options"]["is_disabled"])
 
@@ -277,6 +278,15 @@ class NotifyTest(unittest.TestCase):
             with self.assertLogs("notflix", "WARNING") as logs:
                 parser.send_telegram("hello")
         self.assertNotIn("secret", "\n".join(logs.output))
+
+    def test_rejected_html_is_sent_as_plain_text(self):
+        error = parser.urllib.error.HTTPError("u", 400, "Bad Request", {}, None)
+        with mock.patch.object(parser.urllib.request, "urlopen", side_effect=[error, mock.MagicMock()]) as urlopen:
+            with self.assertLogs("notflix", "WARNING"):
+                parser.send_telegram('<a href="https://x.invalid/?a=1&amp;b=2">Öffnen</a>')
+        payload = json.loads(urlopen.call_args.args[0].data)
+        self.assertNotIn("parse_mode", payload)
+        self.assertEqual(payload["text"], "Öffnen: https://x.invalid/?a=1&b=2")
 
     def test_silent_without_configuration(self):
         with mock.patch.object(parser, "TELEGRAM_BOT_TOKEN", ""):
@@ -325,7 +335,29 @@ class MessagesTest(unittest.TestCase):
                 self.assertTrue(parser.message(key, **values))
 
     def test_household_failed_contains_link(self):
-        self.assertIn("https://x.invalid/l", parser.household_failed_message(3, "https://x.invalid/l"))
+        self.assertIn('<a href="https://x.invalid/l">', parser.household_failed_message(3, "https://x.invalid/l"))
+
+    def test_values_are_escaped(self):
+        # Subjects and links must not break the Telegram HTML
+        text = parser.message(
+            "other_netflix", subject="<b>Tom & Jerry</b>", link='https://x.invalid/?a=1&b="2"', folder="F"
+        )
+        self.assertIn("&lt;b&gt;Tom &amp; Jerry&lt;/b&gt;", text)
+        self.assertIn('<a href="https://x.invalid/?a=1&amp;b=&quot;2&quot;">', text)
+
+    def test_links_sit_behind_text(self):
+        for key in ("household_failed", "access_code", "access_code_unread", "other_netflix"):
+            with self.subTest(key=key):
+                text = parser.message(key, attempts=3, link="https://x.invalid/l", subject="S", folder="F", code="1234")
+                self.assertNotIn("\nhttps://", text)
+                self.assertIn('<a href="https://x.invalid/l">', text)
+
+    def test_access_code_can_be_copied(self):
+        text = parser.message("access_code", code="4711", link="L")
+        self.assertIn("<code>4711</code>", text)
+
+    def test_plain_text(self):
+        self.assertEqual(parser.plain_text('A &amp; <b>B</b> <a href="https://x.invalid/">C</a>'), "A & B C: https://x.invalid/")
 
     def test_household_failed_without_link(self):
         self.assertEqual(
