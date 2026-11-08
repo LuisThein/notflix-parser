@@ -68,7 +68,8 @@ CONFIRM_BUTTON = (By.CSS_SELECTOR, 'button[data-uia="set-primary-location-action
 CLICK_TRIES = 3
 CLICK_REACTION_TIMEOUT = 5
 # Netflix mails that are deleted without a message (E-011)
-SILENT_DELETE_SUBJECTS = ("A new device is using your account",)
+HOUSEHOLD_CONFIRMED_SUBJECT = "Confirmation: Your Netflix Household has been confirmed"
+SILENT_DELETE_SUBJECTS = ("A new device is using your account", HOUSEHOLD_CONFIRMED_SUBJECT)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -480,6 +481,9 @@ def sort_other_mails(mail):
         elif kind in ("netflix", "access_code"):
             keep_netflix_mail(mail, uid, subject, kind)
         elif kind == "other":
+            if subject == HOUSEHOLD_CONFIRMED_SUBJECT and is_netflix_sender(headers["From"]):
+                # Netflix's own receipt: proof that the click took effect
+                log.info("Netflix confirmed the household update")
             log.info("Deleting unneeded mail: %s", subject)
             unneeded.append(uid)
 

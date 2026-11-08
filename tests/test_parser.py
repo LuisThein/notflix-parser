@@ -156,6 +156,12 @@ class ClassifyTest(unittest.TestCase):
             "other",
         )
 
+    def test_household_confirmed_mail_is_deleted(self):
+        self.assertEqual(
+            parser.classify("Netflix <info@account.netflix.com>", parser.HOUSEHOLD_CONFIRMED_SUBJECT),
+            "other",
+        )
+
     def test_access_code_subject_from_stranger_is_other(self):
         self.assertEqual(parser.classify("x@spam.invalid", parser.ACCESS_CODE_SUBJECT), "other")
 
@@ -494,6 +500,15 @@ class SortOtherMailsTest(unittest.TestCase):
         self.assertEqual(mail.inbox, {})
         self.assertEqual(mail.moved, {})
         notify.assert_not_called()
+
+    def test_household_confirmed_mail_deleted_and_logged(self, notify):
+        mail = FakeImap([make_mail("Netflix <info@account.netflix.com>", parser.HOUSEHOLD_CONFIRMED_SUBJECT)])
+        with self.assertLogs("notflix", "INFO") as logs:
+            parser.sort_other_mails(mail)
+        self.assertEqual(mail.inbox, {})
+        self.assertEqual(mail.moved, {})
+        notify.assert_not_called()
+        self.assertIn("Netflix confirmed the household update", "\n".join(logs.output))
 
     def test_spam_is_deleted_silently(self, notify):
         mail = FakeImap([SPAM])
