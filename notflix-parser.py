@@ -67,6 +67,9 @@ CONFIRM_BUTTON = (By.CSS_SELECTOR, 'button[data-uia="set-primary-location-action
 # Clicks per browser session until the page reacts, and seconds to wait each time
 CLICK_TRIES = 3
 CLICK_REACTION_TIMEOUT = 5
+# Test mails for the IMAP IDLE spike stay in the inbox (E-016, temporary:
+# remove when the spike is done)
+SPIKE_TEST_SUBJECT = "idle latenz test"
 # Netflix mails that are deleted without a message (E-011)
 HOUSEHOLD_CONFIRMED_SUBJECT = "Confirmation: Your Netflix Household has been confirmed"
 SILENT_DELETE_SUBJECTS = ("A new device is using your account", HOUSEHOLD_CONFIRMED_SUBJECT)
@@ -476,6 +479,8 @@ def sort_other_mails(mail):
         headers = email.message_from_bytes(part[1])
         subject = decode_subject(headers["Subject"])
         kind = classify(headers["From"], subject)
+        if subject.strip().casefold() == SPIKE_TEST_SUBJECT:
+            continue
         if kind == "household":
             household_uids.add(uid)
         elif kind in ("netflix", "access_code"):
