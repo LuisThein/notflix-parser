@@ -14,7 +14,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY notflix-parser.py .
 
-RUN useradd --create-home notflix
+RUN useradd --create-home notflix \
+    && mkdir /data && chown notflix /data
 USER notflix
 
 # Unhealthy when the last successful mail check is older than 5 minutes

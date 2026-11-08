@@ -403,9 +403,9 @@ class FakeImap:
     def uid(self, command, *args):
         uids = lambda arg: (arg if isinstance(arg, bytes) else arg.encode()).split(b",")
         if command == "SEARCH":
+            # GMX's SUBJECT search lags behind new mails (E-017)
+            assert "SUBJECT" not in args, "SUBJECT search is slow on GMX"
             found = [u for u in self.inbox if "UNSEEN" not in args or u not in self.seen]
-            if "SUBJECT" in args:
-                found = [u for u in found if b"Netflix Household" in self.inbox[u]]
             return "OK", [b" ".join(found)]
         if command == "FETCH":
             data = []
@@ -655,6 +655,47 @@ class CheckMailboxTest(unittest.TestCase):
         self.assertEqual(texts[0], parser.MESSAGES["household_arrived"])
         self.assertIn(CONFIRM_URL, texts[1])
         self.assertIn(b"1", mail.seen)
+
+    def test_household_found_among_unread_mails(self, notify):
+        # Regression: SUBJECT search found new mails 10-27 s late on GMX (E-017)
+        mail = FakeImap([SPAM, HOUSEHOLD, CODE_MAIL])
+        mail.seen.add(b"1")
+        with mock.patch.object(parser, "confirm_household", return_value=True) as confirm:
+            parser.confirm_household_mails(mail)
+        confirm.assert_called_once_with(CONFIRM_URL)
+        # Unread mails other than the household mail only had their headers read
+        self.assertEqual(mail.fetched, [b"2", b"3", b"2"])
+
+    def test_known_household_headers_are_not_fetched_again(self, notify):
+        mail = FakeImap([HOUSEHOLD])
+        with mock.patch.object(parser, "confirm_household", return_value=False):
+            parser.check_mailbox(mail)
+            mail.fetched.clear()
+            parser.confirm_household_mails(mail)
+        self.assertEqual(mail.fetched, [b"1"])
+
+
+class StartMessageTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.file = Path(tmp.name) / "update-note-sent"
+        patcher = mock.patch.object(parser, "UPDATE_NOTE_FILE", self.file)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_update_note_once_then_start_message(self):
+        self.assertEqual(parser.start_message(), parser.UPDATE_NOTE)
+        self.assertEqual(parser.start_message(), parser.MESSAGES["started"])
+
+    def test_new_note_id_is_sent_again(self):
+        parser.start_message()
+        with mock.patch.object(parser, "UPDATE_NOTE_ID", "next"):
+            self.assertEqual(parser.start_message(), parser.UPDATE_NOTE)
+
+    def test_start_message_when_id_cannot_be_stored(self):
+        with mock.patch.object(parser, "UPDATE_NOTE_FILE", self.file / "missing" / "x"):
+            self.assertEqual(parser.start_message(), parser.MESSAGES["started"])
 
 
 if __name__ == "__main__":

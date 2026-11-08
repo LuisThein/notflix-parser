@@ -31,7 +31,8 @@ USERNAME = os.environ["NOTFLIX_EMAIL"]
 PASSWORD = os.environ["NOTFLIX_PASSWORT"]
 IMAP_SERVER = os.environ["IMAP_SERVER"]
 
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))
+# GMX shows new mails to a poll within about a second (E-017)
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "3"))
 # The IMAP connection is reused between polls and only renewed this often,
 # so frequent polling doesn't mean frequent logins
 RECONNECT_AFTER = int(os.environ.get("RECONNECT_AFTER", "900"))
@@ -73,6 +74,19 @@ SPIKE_TEST_SUBJECT = "idle latenz test"
 # Netflix mails that are deleted without a message (E-011)
 HOUSEHOLD_CONFIRMED_SUBJECT = "Confirmation: Your Netflix Household has been confirmed"
 SILENT_DELETE_SUBJECTS = ("A new device is using your account", HOUSEHOLD_CONFIRMED_SUBJECT)
+# After a deploy the chat gets this note once instead of the start message
+# (E-018). Give each new note a new ID; the last sent ID is kept in
+# UPDATE_NOTE_FILE on a Docker volume, so restarts don't repeat it.
+UPDATE_NOTE_ID = "2026-11-08-unseen-3s"
+UPDATE_NOTE = (
+    "🆕 <b>Update: Haushalt-Mails werden schneller bestätigt</b>\n"
+    "• Die Household-Mail wird jetzt unter allen ungelesenen Mails gesucht. "
+    "Die Betreffsuche von GMX fand neue Mails erst 10–27 s nach Eingang.\n"
+    "• Das Postfach wird alle 3 s statt alle 10 s geprüft.\n"
+    "Bisher kam die Bestätigung etwa 30 s nach Eingang der Mail, "
+    "jetzt sollten es etwa 10 s sein."
+)
+UPDATE_NOTE_FILE = Path(os.environ.get("UPDATE_NOTE_FILE", "/data/update-note-sent"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -524,9 +538,29 @@ def check_mailbox(mail):
     sort_other_mails(mail)
 
 
+def unread_household_uids(mail):
+    """
+    UIDs of unread household mails. GMX's SUBJECT search lags 10-27 s behind
+    new mails, UNSEEN doesn't, so the subjects are checked here (E-017).
+    """
+    status, data = mail.uid("SEARCH", None, "UNSEEN")
+    unread = data[0].split()
+    unknown = [uid for uid in unread if uid not in household_uids]
+    if unknown:
+        status, data = mail.uid(
+            "FETCH", b",".join(unknown), "(BODY.PEEK[HEADER.FIELDS (SUBJECT)])"
+        )
+        for part in data:
+            if not isinstance(part, tuple):
+                continue
+            headers = email.message_from_bytes(part[1])
+            if decode_subject(headers["Subject"]) == TARGET_SUBJECT:
+                household_uids.add(re.search(rb"UID (\d+)", part[0]).group(1))
+    return [uid for uid in unread if uid in household_uids]
+
+
 def confirm_household_mails(mail):
-    status, messages = mail.uid("SEARCH", None, "UNSEEN", "SUBJECT", '"Netflix Household"')
-    for uid in messages[0].split():
+    for uid in unread_household_uids(mail):
         # PEEK keeps the mail unread until it has been handled
         status, msg_data = mail.uid("FETCH", uid, "(BODY.PEEK[])")
         msg = email.message_from_bytes(msg_data[0][1])
@@ -574,6 +608,23 @@ def household_failed_message(count, link):
     return message("household_failed_no_link")
 
 
+def start_message():
+    """The update note on the first start after a deploy, else the start message."""
+    try:
+        if UPDATE_NOTE_FILE.read_text().strip() == UPDATE_NOTE_ID:
+            return message("started")
+    except OSError:
+        pass
+    try:
+        UPDATE_NOTE_FILE.write_text(UPDATE_NOTE_ID + "\n")
+    except OSError as e:
+        # Without the volume the note would come on every start
+        log.warning("Can't store the update note ID, sending the start message: %s", e)
+        return message("started")
+    log.info("Sending update note %s", UPDATE_NOTE_ID)
+    return UPDATE_NOTE
+
+
 def main():
     # Let `docker stop` end the loop right away instead of waiting for SIGKILL
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
@@ -581,7 +632,7 @@ def main():
     log.info("Started, checking %s every %ds", IMAP_SERVER, POLL_INTERVAL)
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         log.info("Telegram not configured, notifications are off")
-    notify(message("started"))
+    notify(start_message())
     mail = None
     connected_at = 0.0
     failures = 0
